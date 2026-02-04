@@ -1,13 +1,15 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
 import 'package:provider/provider.dart';
 import 'package:vibration/vibration.dart';
 import '../core/kibushi_state.dart';
+import '../services/recorder_service.dart';
+import '../services/playback_service.dart';
 import '../services/tts_collection_service.dart';
 
-/// Écran de collecte TTS structurée
-/// Mode spécial pour enregistrer des phrases pour entraînement du modèle vocal
+/// Écran de collecte TTS structurée avec streams temps réel
 class TTSCollectionScreen extends StatefulWidget {
   const TTSCollectionScreen({super.key});
 
@@ -16,40 +18,85 @@ class TTSCollectionScreen extends StatefulWidget {
 }
 
 class _TTSCollectionScreenState extends State<TTSCollectionScreen> {
-  String _selectedCategory = 'phrases';
   final TTSCollectionService _collectionService = TTSCollectionService();
+  final RecorderService _recorderService = RecorderService();
+  final PlaybackService _playbackService = PlaybackService();
+  
+  // Subscriptions
+  StreamSubscription? _recorderStateSub;
+  StreamSubscription? _amplitudeSub;
+  StreamSubscription? _playerStateSub;
+  StreamSubscription? _playerCompletionSub;
+  
+  // États
+  String _selectedCategory = 'phrases';
   Map<String, CategoryStats>? _stats;
-  bool _isRecording = false;
+  RecorderState _recorderState = RecorderState.idle;
+  PlayerState _playerState = PlayerState.idle;
   String? _currentPrompt;
+  double _currentAmplitude = 0.0;
+  String? _lastRecordingPath;
+  bool _isPlayingLast = false;
   
   @override
   void initState() {
     super.initState();
-    _initService();
+    _initServices();
+    _initStreams();
   }
   
-  Future<void> _initService() async {
+  void _initStreams() {
+    // Recorder streams
+    _recorderStateSub = _recorderService.stateStream.listen((state) {
+      setState(() => _recorderState = state);
+    });
+    
+    _amplitudeSub = _recorderService.amplitudeStream.listen((amp) {
+      setState(() => _currentAmplitude = amp);
+    });
+    
+    // Player streams
+    _playerStateSub = _playbackService.stateStream.listen((state) {
+      setState(() => _playerState = state);
+    });
+    
+    _playerCompletionSub = _playbackService.completionStream.listen((_) {
+      setState(() => _isPlayingLast = false);
+    });
+  }
+  
+  Future<void> _initServices() async {
     await _collectionService.init();
-    _loadStats();
+    await _loadStats();
     _loadNewPrompt();
   }
   
   Future<void> _loadStats() async {
     final stats = await _collectionService.getStats();
-    setState(() {
-      _stats = stats;
-    });
+    setState(() => _stats = stats);
   }
   
   void _loadNewPrompt() {
     final prompt = _collectionService.getRandomPrompt(_selectedCategory);
-    setState(() {
-      _currentPrompt = prompt;
-    });
+    setState(() => _currentPrompt = prompt);
   }
   
   @override
+  void dispose() {
+    _recorderStateSub?.cancel();
+    _amplitudeSub?.cancel();
+    _playerStateSub?.cancel();
+    _playerCompletionSub?.cancel();
+    _recorderService.dispose();
+    _playbackService.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final isRecording = _recorderState == RecorderState.recording;
+    final isPaused = _recorderState == RecorderState.paused;
+    
     return Scaffold(
       backgroundColor: const Color(0xFF0A0A0A),
       body: SafeArea(
@@ -61,17 +108,29 @@ class _TTSCollectionScreenState extends State<TTSCollectionScreen> {
             // Stats
             if (_stats != null) _buildStatsRow(),
             
-            const SizedBox(height: 40),
+            const SizedBox(height: 30),
+            
+            // Visualisation amplitude (pendant enregistrement)
+            if (isRecording || isPaused)
+              _buildAmplitudeVisualizer(),
+            
+            const SizedBox(height: 20),
             
             // Prompt
             _buildPromptArea(),
             
             const Spacer(),
             
-            // Bouton d'enregistrement
+            // Bouton d'enregistrement avec état
             _buildRecordButton(),
             
-            const SizedBox(height: 40),
+            const SizedBox(height: 20),
+            
+            // Bouton lecture du dernier enregistrement
+            if (_lastRecordingPath != null)
+              _buildPlaybackButton(),
+            
+            const SizedBox(height: 20),
             
             // Sélecteur de catégorie
             _buildCategorySelector(),
@@ -109,8 +168,63 @@ class _TTSCollectionScreenState extends State<TTSCollectionScreen> {
               letterSpacing: 1,
             ),
           ),
-          const SizedBox(width: 48),
+          // Indicateur état recorder
+          _buildStatusIndicator(),
         ],
+      ),
+    );
+  }
+  
+  Widget _buildStatusIndicator() {
+    Color color;
+    IconData icon;
+    
+    switch (_recorderState) {
+      case RecorderState.recording:
+        color = Colors.redAccent;
+        icon = PhosphorIconsFill.record;
+        break;
+      case RecorderState.paused:
+        color = Colors.orangeAccent;
+        icon = PhosphorIconsFill.pause;
+        break;
+      case RecorderState.error:
+        color = Colors.red;
+        icon = PhosphorIconsFill.warning;
+        break;
+      default:
+        color = Colors.white24;
+        icon = PhosphorIconsRegular.circle;
+    }
+    
+    return PhosphorIcon(
+      icon,
+      color: color,
+      size: 20,
+    );
+  }
+  
+  Widget _buildAmplitudeVisualizer() {
+    return Container(
+      height: 40,
+      margin: const EdgeInsets.symmetric(horizontal: 40),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: List.generate(15, (index) {
+          final height = (_currentAmplitude * 30 * (0.5 + (index % 3) * 0.2)).clamp(4.0, 30.0);
+          return AnimatedContainer(
+            duration: const Duration(milliseconds: 50),
+            margin: const EdgeInsets.symmetric(horizontal: 2),
+            width: 3,
+            height: height,
+            decoration: BoxDecoration(
+              color: _recorderState == RecorderState.paused
+                  ? Colors.orangeAccent.withOpacity(0.5)
+                  : Colors.redAccent.withOpacity(0.3 + _currentAmplitude * 0.5),
+              borderRadius: BorderRadius.circular(2),
+            ),
+          );
+        }),
       ),
     );
   }
@@ -225,24 +339,34 @@ class _TTSCollectionScreenState extends State<TTSCollectionScreen> {
   }
   
   Widget _buildRecordButton() {
+    final isRecording = _recorderState == RecorderState.recording;
+    final isPaused = _recorderState == RecorderState.paused;
+    
     return GestureDetector(
       onTapDown: (_) => _startRecording(),
       onTapUp: (_) => _stopRecording(),
       onTapCancel: () => _stopRecording(),
+      onLongPress: isRecording ? () => _pauseRecording() : null,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
-        width: _isRecording ? 160 : 120,
-        height: _isRecording ? 160 : 120,
+        width: isRecording ? 160 : 120,
+        height: isRecording ? 160 : 120,
         decoration: BoxDecoration(
-          color: _isRecording 
+          color: isRecording 
               ? Colors.redAccent.withOpacity(0.2) 
-              : Colors.white.withOpacity(0.1),
+              : isPaused
+                  ? Colors.orangeAccent.withOpacity(0.2)
+                  : Colors.white.withOpacity(0.1),
           shape: BoxShape.circle,
           border: Border.all(
-            color: _isRecording ? Colors.redAccent : Colors.white30,
-            width: _isRecording ? 3 : 2,
+            color: isRecording 
+                ? Colors.redAccent 
+                : isPaused
+                    ? Colors.orangeAccent
+                    : Colors.white30,
+            width: isRecording ? 3 : 2,
           ),
-          boxShadow: _isRecording
+          boxShadow: isRecording
               ? [
                   BoxShadow(
                     color: Colors.redAccent.withOpacity(0.3),
@@ -250,14 +374,48 @@ class _TTSCollectionScreenState extends State<TTSCollectionScreen> {
                     spreadRadius: 10,
                   ),
                 ]
-              : null,
+              : isPaused
+                  ? [
+                      BoxShadow(
+                        color: Colors.orangeAccent.withOpacity(0.3),
+                        blurRadius: 30,
+                        spreadRadius: 5,
+                      ),
+                    ]
+                  : null,
         ),
         child: PhosphorIcon(
-          _isRecording 
+          isRecording 
               ? PhosphorIconsRegular.stop 
-              : PhosphorIconsRegular.microphone,
-          size: _isRecording ? 56 : 48,
-          color: _isRecording ? Colors.redAccent : Colors.white70,
+              : isPaused
+                  ? PhosphorIconsRegular.play
+                  : PhosphorIconsRegular.microphone,
+          size: isRecording ? 56 : 48,
+          color: isRecording 
+              ? Colors.redAccent 
+              : isPaused
+                  ? Colors.orangeAccent
+                  : Colors.white70,
+        ),
+      ),
+    );
+  }
+  
+  Widget _buildPlaybackButton() {
+    final isPlaying = _playerState == PlayerState.playing || _isPlayingLast;
+    
+    return TextButton.icon(
+      onPressed: _playLastRecording,
+      icon: PhosphorIcon(
+        isPlaying ? PhosphorIconsRegular.stop : PhosphorIconsRegular.play,
+        color: Colors.white54,
+        size: 20,
+      ),
+      label: Text(
+        isPlaying ? 'arrêter' : 'écouter',
+        style: const TextStyle(
+          color: Colors.white54,
+          fontSize: 13,
         ),
       ),
     );
@@ -326,45 +484,83 @@ class _TTSCollectionScreenState extends State<TTSCollectionScreen> {
     );
   }
   
-  void _startRecording() {
+  Future<void> _startRecording() async {
     HapticFeedback.lightImpact();
-    setState(() {
-      _isRecording = true;
-    });
-    // TODO: Démarrer l'enregistrement via RecorderService
+    
+    // Vérifie permission d'abord
+    if (!await _recorderService.checkPermission()) {
+      _showMessage('permission microphone requise', isError: true);
+      return;
+    }
+    
+    final path = await _recorderService.startRecording();
+    if (path == null) {
+      _showMessage('erreur démarrage', isError: true);
+    }
   }
   
-  void _stopRecording() async {
-    if (!_isRecording) return;
+  Future<void> _stopRecording() async {
+    if (_recorderState != RecorderState.recording && _recorderState != RecorderState.paused) return;
     
     HapticFeedback.mediumImpact();
-    setState(() {
-      _isRecording = false;
-    });
     
-    // TODO: Arrêter et sauvegarder via RecorderService
+    final path = await _recorderService.stopRecording();
+    if (path != null) {
+      _lastRecordingPath = path;
+      
+      // Sauvegarde dans le service de collection
+      if (_currentPrompt != null) {
+        await _collectionService.saveRecording(
+          category: _selectedCategory,
+          prompt: _currentPrompt!,
+          audioPath: path,
+        );
+      }
+      
+      _showMessage('enregistré');
+      await _loadStats();
+      _loadNewPrompt();
+    }
+  }
+  
+  Future<void> _pauseRecording() async {
+    if (_recorderState == RecorderState.recording) {
+      await _recorderService.pauseRecording();
+      _showMessage('pause');
+    } else if (_recorderState == RecorderState.paused) {
+      await _recorderService.resumeRecording();
+    }
+  }
+  
+  Future<void> _playLastRecording() async {
+    if (_lastRecordingPath == null) return;
     
-    // Feedback visuel
+    if (_playerState == PlayerState.playing) {
+      await _playbackService.stop();
+      setState(() => _isPlayingLast = false);
+    } else {
+      setState(() => _isPlayingLast = true);
+      await _playbackService.playLocalFile(_lastRecordingPath!);
+    }
+  }
+  
+  void _showMessage(String message, {bool isError = false}) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: const Text('enregistré', style: TextStyle(color: Colors.white70)),
-        backgroundColor: Colors.black.withOpacity(0.8),
+        content: Text(message, style: const TextStyle(color: Colors.white70)),
+        backgroundColor: isError 
+            ? Colors.redAccent.withOpacity(0.8)
+            : Colors.black.withOpacity(0.8),
         duration: const Duration(seconds: 1),
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
       ),
     );
-    
-    // Recharge les stats et un nouveau prompt
-    await _loadStats();
-    _loadNewPrompt();
   }
   
-  void _exportData() async {
+  Future<void> _exportData() async {
     try {
       final zipPath = await _collectionService.prepareExport();
-      
-      // TODO: Démarrer serveur HTTP pour transfert
       
       if (mounted) {
         showDialog(
@@ -376,7 +572,7 @@ class _TTSCollectionScreenState extends State<TTSCollectionScreen> {
               style: TextStyle(color: Colors.white70),
             ),
             content: Text(
-              'fichier: $zipPath\n\nsur le même WiFi, ouvre \"http://[IP]:8080\" sur ton PC',
+              'fichier: $zipPath\n\nenvoie via Telegram à baby',
               style: TextStyle(color: Colors.white54),
             ),
             actions: [
@@ -389,12 +585,7 @@ class _TTSCollectionScreenState extends State<TTSCollectionScreen> {
         );
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('erreur: $e', style: const TextStyle(color: Colors.white70)),
-          backgroundColor: Colors.redAccent.withOpacity(0.8),
-        ),
-      );
+      _showMessage('erreur: $e', isError: true);
     }
   }
 }

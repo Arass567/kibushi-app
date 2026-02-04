@@ -1,12 +1,112 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:phosphor_flutter/phosphor_flutter.dart';
 import 'package:provider/provider.dart';
 import 'package:vibration/vibration.dart';
 import '../core/kibushi_state.dart';
+import '../services/recorder_service.dart';
 
-class MainScreen extends StatelessWidget {
+/// Écran principal avec visualisation audio temps réel
+class MainScreen extends StatefulWidget {
   const MainScreen({super.key});
+
+  @override
+  State<MainScreen> createState() => _MainScreenState();
+}
+
+class _MainScreenState extends State<MainScreen> {
+  final RecorderService _recorderService = RecorderService();
+  
+  // Streams subscriptions
+  StreamSubscription? _stateSub;
+  StreamSubscription? _amplitudeSub;
+  StreamSubscription? _errorSub;
+  
+  double _currentAmplitude = 0.0;
+  RecorderState _recorderState = RecorderState.idle;
+  AudioError? _lastError;
+  
+  @override
+  void initState() {
+    super.initState();
+    _initStreams();
+  }
+  
+  void _initStreams() {
+    // Écoute changements d'état
+    _stateSub = _recorderService.stateStream.listen((state) {
+      setState(() => _recorderState = state);
+      _handleStateChange(state);
+    });
+    
+    // Écoute amplitude pour visualisation
+    _amplitudeSub = _recorderService.amplitudeStream.listen((amp) {
+      setState(() => _currentAmplitude = amp);
+    });
+    
+    // Écoute erreurs
+    _errorSub = _recorderService.errorStream.listen((error) {
+      if (error != null) {
+        setState(() => _lastError = error);
+        _showErrorSnackBar(error);
+      }
+    });
+  }
+  
+  void _handleStateChange(RecorderState state) {
+    // Haptic feedback selon l'état
+    switch (state) {
+      case RecorderState.recording:
+        HapticFeedback.lightImpact();
+        Vibration.vibrate(duration: 30, amplitude: 50);
+        break;
+      case RecorderState.paused:
+        Vibration.vibrate(pattern: [0, 20, 40, 20], intensities: [50, 80, 50]);
+        break;
+      case RecorderState.idle:
+        if (_recorderState == RecorderState.recording) {
+          HapticFeedback.mediumImpact();
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  
+  void _showErrorSnackBar(AudioError error) {
+    String message;
+    switch (error) {
+      case AudioError.noPermission:
+        message = 'microphone requis';
+        break;
+      case AudioError.recordingFailed:
+        message = 'erreur enregistrement';
+        break;
+      case AudioError.fileSystemError:
+        message = 'erreur fichier';
+        break;
+      default:
+        message = 'erreur audio';
+    }
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message, style: const TextStyle(color: Colors.white70)),
+        backgroundColor: Colors.redAccent.withOpacity(0.8),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _stateSub?.cancel();
+    _amplitudeSub?.cancel();
+    _errorSub?.cancel();
+    _recorderService.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -57,10 +157,23 @@ class MainScreen extends StatelessWidget {
             },
           ),
           
+          // Visualisation amplitude (visible pendant l'enregistrement)
+          if (_recorderState == RecorderState.recording)
+            Positioned(
+              top: 200,
+              left: 0,
+              right: 0,
+              child: _AmplitudeVisualizer(amplitude: _currentAmplitude),
+            ),
+          
           Center(
             child: Consumer<KibushiState>(
               builder: (context, state, child) {
-                return _MicroButton(state: state);
+                return _MicroButton(
+                  state: state,
+                  recorderService: _recorderService,
+                  recorderState: _recorderState,
+                );
               },
             ),
           ),
@@ -125,9 +238,49 @@ class FadeInText extends StatelessWidget {
   }
 }
 
+/// Visualisation temps réel de l'amplitude audio
+class _AmplitudeVisualizer extends StatelessWidget {
+  final double amplitude;
+  
+  const _AmplitudeVisualizer({required this.amplitude});
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 60,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: List.generate(20, (index) {
+          // Animation des barres selon l'amplitude
+          final delay = index * 0.05;
+          final height = (amplitude * 50 * (0.5 + (index % 3) * 0.25)).clamp(4.0, 50.0);
+          
+          return AnimatedContainer(
+            duration: const Duration(milliseconds: 50),
+            margin: const EdgeInsets.symmetric(horizontal: 2),
+            width: 4,
+            height: height,
+            decoration: BoxDecoration(
+              color: Colors.redAccent.withOpacity(0.3 + amplitude * 0.5),
+              borderRadius: BorderRadius.circular(2),
+            ),
+          );
+        }),
+      ),
+    );
+  }
+}
+
 class _MicroButton extends StatefulWidget {
   final KibushiState state;
-  const _MicroButton({required this.state});
+  final RecorderService recorderService;
+  final RecorderState recorderState;
+  
+  const _MicroButton({
+    required this.state,
+    required this.recorderService,
+    required this.recorderState,
+  });
 
   @override
   State<_MicroButton> createState() => _MicroButtonState();
@@ -142,61 +295,50 @@ class _MicroButtonState extends State<_MicroButton> {
     
     final currentState = widget.state.currentState;
     if (_previousState != currentState) {
-      _handleStateChange(_previousState, currentState);
       _previousState = currentState;
     }
   }
 
-  void _handleStateChange(AppState? oldState, AppState newState) {
-    // Micro-vibrations selon les transitions
-    switch (newState) {
-      case AppState.recording:
-        // Vibration légère au début de l'enregistrement
-        HapticFeedback.lightImpact();
-        Vibration.vibrate(duration: 30, amplitude: 50);
-        break;
-      case AppState.reflecting:
-        // Double pulsation discrète
-        Vibration.vibrate(pattern: [0, 20, 40, 20], intensities: [50, 80, 50]);
-        break;
-      case AppState.mirrorPlayback:
-        // Vibration "success" très douce
-        HapticFeedback.mediumImpact();
-        break;
-      default:
-        break;
-    }
-  }
-
-  void _onTapDown(TapDownDetails details) {
+  Future<void> _onTapDown(TapDownDetails details) async {
     if (widget.state.currentState == AppState.reflecting || 
         widget.state.currentState == AppState.mirrorPlayback ||
         widget.state.currentState == AppState.consentPrompt) return;
     
-    // Feedback immédiat au toucher
     HapticFeedback.selectionClick();
-    widget.state.startVoiceCapture();
+    
+    // Démarrage enregistrement via RecorderService
+    final path = await widget.recorderService.startRecording();
+    if (path != null) {
+      widget.state.startVoiceCapture();
+    }
   }
 
-  void _onTapUp(TapUpDetails details) {
+  Future<void> _onTapUp(TapUpDetails details) async {
     if (widget.state.currentState == AppState.reflecting || 
         widget.state.currentState == AppState.mirrorPlayback) return;
     
+    // Arrêt enregistrement
+    await widget.recorderService.stopRecording();
     widget.state.stopVoiceCapture();
   }
 
   @override
   Widget build(BuildContext context) {
-    bool isFirst = widget.state.currentState == AppState.firstLaunch;
-    bool isRecording = widget.state.currentState == AppState.recording;
-    bool isReflecting = widget.state.currentState == AppState.reflecting;
-    bool isMirroring = widget.state.currentState == AppState.mirrorPlayback;
+    final isRecording = widget.recorderState == RecorderState.recording ||
+                        widget.state.currentState == AppState.recording;
+    final isPaused = widget.recorderState == RecorderState.paused;
+    final isReflecting = widget.state.currentState == AppState.reflecting;
+    final isMirroring = widget.state.currentState == AppState.mirrorPlayback;
+    final isFirst = widget.state.currentState == AppState.firstLaunch;
     
     return GestureDetector(
       onTapDown: _onTapDown,
       onTapUp: _onTapUp,
-      onTapCancel: () {
-        if (isRecording) widget.state.stopVoiceCapture();
+      onTapCancel: () async {
+        if (isRecording) {
+          await widget.recorderService.stopRecording();
+          widget.state.stopVoiceCapture();
+        }
       },
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 300),
@@ -204,10 +346,10 @@ class _MicroButtonState extends State<_MicroButton> {
         width: isRecording ? 140 : 100,
         height: isRecording ? 140 : 100,
         decoration: BoxDecoration(
-          color: _getBgColor(isRecording, isReflecting, isMirroring, isFirst),
+          color: _getBgColor(isRecording, isPaused, isReflecting, isMirroring, isFirst),
           shape: BoxShape.circle,
           border: Border.all(
-            color: _getBorderColor(isRecording, isReflecting, isMirroring, isFirst),
+            color: _getBorderColor(isRecording, isPaused, isReflecting, isMirroring, isFirst),
             width: isRecording ? 3 : 2,
           ),
           boxShadow: [
@@ -216,6 +358,12 @@ class _MicroButtonState extends State<_MicroButton> {
                 color: Colors.redAccent.withOpacity(0.2),
                 blurRadius: 40,
                 spreadRadius: 10,
+              ),
+            if (isPaused)
+              BoxShadow(
+                color: Colors.orangeAccent.withOpacity(0.2),
+                blurRadius: 30,
+                spreadRadius: 5,
               ),
             if (isReflecting)
               BoxShadow(
@@ -233,47 +381,51 @@ class _MicroButtonState extends State<_MicroButton> {
         ),
         child: AnimatedSwitcher(
           duration: const Duration(milliseconds: 200),
-          child: _getIconWidget(isRecording, isReflecting, isMirroring, isFirst),
+          child: _getIconWidget(isRecording, isPaused, isReflecting, isMirroring, isFirst),
         ),
       ),
     );
   }
 
-  Widget _getIconWidget(bool rec, bool ref, bool mir, bool fir) {
-    final iconData = _getPhosphorIcon(rec, ref, mir, fir);
-    final color = _getIconColor(rec, ref, mir, fir);
+  Widget _getIconWidget(bool rec, bool paused, bool ref, bool mir, bool fir) {
+    final iconData = _getPhosphorIcon(rec, paused, ref, mir, fir);
+    final color = _getIconColor(rec, paused, ref, mir, fir);
     
     return PhosphorIcon(
       iconData,
-      key: ValueKey<String>('${rec}_${ref}_${mir}_${fir}'),
+      key: ValueKey<String>('${rec}_${paused}_${ref}_${mir}_${fir}'),
       size: rec ? 48 : 40,
       color: color,
     );
   }
 
-  PhosphorIconData _getPhosphorIcon(bool rec, bool ref, bool mir, bool fir) {
+  PhosphorIconData _getPhosphorIcon(bool rec, bool paused, bool ref, bool mir, bool fir) {
+    if (paused) return PhosphorIconsRegular.pause; // Pause
     if (ref) return PhosphorIconsRegular.circle; // Souffle/discret
     if (mir) return PhosphorIconsRegular.speakerHigh; // Écoute
     if (fir) return PhosphorIconsRegular.waveform; // Première ouverture
     return PhosphorIconsRegular.microphone; // Idle/Recording
   }
 
-  Color _getBgColor(bool rec, bool ref, bool mir, bool fir) {
+  Color _getBgColor(bool rec, bool paused, bool ref, bool mir, bool fir) {
     if (rec) return Colors.redAccent.withOpacity(0.08);
+    if (paused) return Colors.orangeAccent.withOpacity(0.08);
     if (ref) return Colors.white.withOpacity(0.08);
     if (mir) return Colors.blueAccent.withOpacity(0.05);
     return Colors.transparent;
   }
 
-  Color _getBorderColor(bool rec, bool ref, bool mir, bool fir) {
+  Color _getBorderColor(bool rec, bool paused, bool ref, bool mir, bool fir) {
     if (rec) return Colors.redAccent.withOpacity(0.6);
+    if (paused) return Colors.orangeAccent.withOpacity(0.6);
     if (ref) return Colors.white54;
     if (mir) return Colors.blueAccent.withOpacity(0.4);
     return Colors.white24;
   }
 
-  Color _getIconColor(bool rec, bool ref, bool mir, bool fir) {
+  Color _getIconColor(bool rec, bool paused, bool ref, bool mir, bool fir) {
     if (rec) return Colors.redAccent;
+    if (paused) return Colors.orangeAccent;
     if (ref) return Colors.white70;
     if (mir) return Colors.blueAccent;
     return Colors.white60;
